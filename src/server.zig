@@ -24,8 +24,8 @@ const Process = struct {
 pub fn init(allocator: std.mem.Allocator) !Server {
     try std.fs.cwd().makePath("/etc/.z");
     const f = try std.fs.cwd().createFile("/etc/.z/z", .{ .truncate = true, .exclusive = false, .mode = 0o600 });
-    const l = std.ArrayList(Command).init(allocator);
-    const l1 = std.ArrayList(Process).init(allocator);
+    const l: std.ArrayList(Command) = .empty;
+    const l1: std.ArrayList(Process) = .empty;
     const m = std.Thread.Mutex{};
     const es = std.process.EnvMap.init(allocator);
     const s = Server{
@@ -50,7 +50,7 @@ pub fn deinit(self: *Server) void {
                 if (v.process.term != null) {
                     break;
                 }
-                std.time.sleep(1 * std.time.ns_per_s);
+                std.Thread.sleep(std.time.ns_per_s);
             }
         }
     }
@@ -62,8 +62,8 @@ pub fn deinit(self: *Server) void {
         }
         self.allocator.free(v.args);
     }
-    self.processes.deinit();
-    self.commands.deinit();
+    self.processes.deinit(self.allocator);
+    self.commands.deinit(self.allocator);
     self.envs.deinit();
     self.z.close();
     self.mutex.unlock();
@@ -79,12 +79,12 @@ pub fn start(self: *Server) !void {
             break;
         } else |err| {
             self.e(err);
-            std.time.sleep(1 * std.time.ns_per_s);
+            std.Thread.sleep(std.time.ns_per_s);
             if (helper.testNetwork("2400:3200::1")) |_| {
                 break;
             } else |err1| {
                 self.e(err1);
-                std.time.sleep(1 * std.time.ns_per_s);
+                std.Thread.sleep(std.time.ns_per_s);
                 continue;
             }
         }
@@ -109,7 +109,7 @@ pub fn start(self: *Server) !void {
     }
     errdefer {
         // wait for sub threads ready first, better communication way should probably be used
-        std.time.sleep(3 * std.time.ns_per_s);
+        std.Thread.sleep(3 * std.time.ns_per_s);
     }
     const r = try helper.readFile(self.allocator, "/etc/.z/command.json");
     if (r) |r1| {
@@ -136,7 +136,7 @@ pub fn start(self: *Server) !void {
                 .id = v.id,
                 .args = args,
             };
-            try self.commands.append(c);
+            try self.commands.append(self.allocator, c);
             const thread = try std.Thread.spawn(.{}, Server.run, .{ self, c });
             thread.detach();
         }
@@ -231,7 +231,7 @@ fn _handle(self: *Server, conn: std.net.Server.Connection) !void {
                         if (v.process.term != null) {
                             break;
                         }
-                        std.time.sleep(1 * std.time.ns_per_s);
+                        std.Thread.sleep(std.time.ns_per_s);
                     }
                 }
             }
@@ -251,7 +251,7 @@ fn _handle(self: *Server, conn: std.net.Server.Connection) !void {
                         if (v.process.term != null) {
                             break;
                         }
-                        std.time.sleep(1 * std.time.ns_per_s);
+                        std.Thread.sleep(std.time.ns_per_s);
                     }
                 }
             }
@@ -286,7 +286,7 @@ fn _handle(self: *Server, conn: std.net.Server.Connection) !void {
                         if (v.process.term != null) {
                             break;
                         }
-                        std.time.sleep(1 * std.time.ns_per_s);
+                        std.Thread.sleep(std.time.ns_per_s);
                     }
                 }
             }
@@ -414,7 +414,7 @@ fn _handle(self: *Server, conn: std.net.Server.Connection) !void {
         .id = id,
         .args = args,
     };
-    try self.commands.append(c1);
+    try self.commands.append(self.allocator, c1);
     try self.saveCommands();
     const thread = try std.Thread.spawn(.{}, Server.run, .{ self, c1 });
     thread.detach();
@@ -434,9 +434,11 @@ fn endHandle(self: *Server, conn: std.net.Server.Connection) !void {
 }
 
 fn saveCommands(self: *Server) !void {
-    var string = std.ArrayList(u8).init(self.allocator);
-    defer string.deinit();
-    try std.json.stringify(self.commands.items, .{ .whitespace = .indent_4 }, string.writer());
+    var string: std.ArrayList(u8) = .empty;
+    defer string.deinit(self.allocator);
+    const json = try jsonStringifyCommands(self.allocator, self.commands.items);
+    defer self.allocator.free(json);
+    try string.appendSlice(self.allocator, json);
     const f = try std.fs.cwd().createFile("/etc/.z/command.json", .{ .truncate = true, .exclusive = false, .mode = 0o600 });
     defer f.close();
     try f.writeAll(string.items);
@@ -462,9 +464,11 @@ fn saveEnvs(self: *Server) !void {
         done = index;
         index = index + 1;
     }
-    var string = std.ArrayList(u8).init(self.allocator);
-    defer string.deinit();
-    try std.json.stringify(l, .{ .whitespace = .indent_4 }, string.writer());
+    var string: std.ArrayList(u8) = .empty;
+    defer string.deinit(self.allocator);
+    const json = try jsonStringifyStrings(self.allocator, l);
+    defer self.allocator.free(json);
+    try string.appendSlice(self.allocator, json);
     const f = try std.fs.cwd().createFile("/etc/.z/env.json", .{ .truncate = true, .exclusive = false, .mode = 0o600 });
     defer f.close();
     try f.writeAll(string.items);
@@ -484,21 +488,8 @@ fn _run(self: *Server, c: Command) !void {
     const f = try std.fs.cwd().createFile(b, .{ .truncate = true, .exclusive = false, .mode = 0o600 });
     defer f.close();
 
-    self.mutex.lock();
-    if (self.envs.count() != 0) {
-        var it = self.envs.iterator();
-        while (it.next()) |entry| {
-            errdefer self.mutex.unlock();
-            const k = try self.allocator.dupeZ(u8, entry.key_ptr.*);
-            defer self.allocator.free(k);
-            const v = try self.allocator.dupeZ(u8, entry.value_ptr.*);
-            defer self.allocator.free(v);
-            if (helper.setenv(k, v) == -1) {
-                return error.SetenvFailed;
-            }
-        }
-    }
-    self.mutex.unlock();
+    // 环境变量将通过 cp.env_map 传递给子进程，不需要设置当前进程的环境变量
+    // 如果将来需要设置当前进程的环境变量，可以使用系统调用或实现自己的 setenv
 
     var cp = std.process.Child.init(c.args, self.allocator);
     cp.stdout_behavior = .Pipe;
@@ -532,7 +523,7 @@ fn _run(self: *Server, c: Command) !void {
         .id = c.id,
         .process = &cp,
     };
-    self.processes.append(p) catch |err| {
+    self.processes.append(self.allocator, p) catch |err| {
         self.mutex.unlock();
         return err;
     };
@@ -584,4 +575,48 @@ fn ioCopy(self: *Server, dst: std.fs.File, src: std.fs.File, dst_mutex: *std.Thr
 
 test "server" {
     std.debug.print("hello, zhen.\n", .{});
+}
+
+fn jsonStringifyStrings(allocator: std.mem.Allocator, arr: []const []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    try out.append(allocator, '[');
+    for (arr, 0..) |s, i| {
+        if (i != 0) try out.append(allocator, ',');
+        try out.append(allocator, '"');
+        for (s) |ch| {
+            switch (ch) {
+                '"' => try out.appendSlice(allocator, "\\\""),
+                '\\' => try out.appendSlice(allocator, "\\\\"),
+                else => if (ch < 0x20) {
+                    var buf: [6]u8 = .{ '\\', 'u', '0', '0', 0, 0 };
+                    const hex = "0123456789abcdef";
+                    buf[4] = hex[(ch >> 4) & 0xF];
+                    buf[5] = hex[ch & 0xF];
+                    try out.appendSlice(allocator, &buf);
+                } else try out.append(allocator, ch),
+            }
+        }
+        try out.append(allocator, '"');
+    }
+    try out.append(allocator, ']');
+    return try out.toOwnedSlice(allocator);
+}
+
+fn jsonStringifyCommands(allocator: std.mem.Allocator, arr: []const Command) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    try out.append(allocator, '[');
+    for (arr, 0..) |c, i| {
+        if (i != 0) try out.append(allocator, ',');
+        try out.appendSlice(allocator, "{\"id\":");
+        try std.fmt.format(out.writer(allocator), "{}", .{c.id});
+        try out.appendSlice(allocator, ",\"args\":");
+        const args_json = try jsonStringifyStrings(allocator, c.args);
+        defer allocator.free(args_json);
+        try out.appendSlice(allocator, args_json);
+        try out.append(allocator, '}');
+    }
+    try out.append(allocator, ']');
+    return try out.toOwnedSlice(allocator);
 }
